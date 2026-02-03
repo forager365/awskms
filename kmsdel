@@ -237,3 +237,52 @@ if [[ $FAIL_COUNT -gt 0 ]]; then
 fi
 
 exit 0
+
+===========
+#!/bin/bash
+
+# --- Configuration ---
+INPUT_FILE="keys_list.txt"  # The file containing your Key IDs
+OUTPUT_FILE="deletion_log.txt" # The file to append output to
+
+# Check if input file exists
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: Input file '$INPUT_FILE' not found."
+    exit 1
+fi
+
+echo "Starting key deletion schedule..."
+echo "Reading from: $INPUT_FILE"
+echo "Logging to: $OUTPUT_FILE"
+
+# --- The Loop ---
+# IFS= prevents leading/trailing whitespace issues
+# -r prevents backslash interpretation
+while IFS= read -r KEY_ID || [ -n "$KEY_ID" ]; do
+    
+    # Skip empty lines if there are any
+    if [[ -z "$KEY_ID" ]]; then
+        continue
+    fi
+
+    echo "Processing Key ID: $KEY_ID"
+
+    # Write a header to the log file for readability
+    echo "--- Output for $KEY_ID ---" >> "$OUTPUT_FILE"
+
+    # Run the AWS command
+    # '>>' appends standard output to the file
+    # '2>&1' captures errors (stderr) and puts them in the same file
+    aws kms schedule-key-deletion \
+        --key-id "$KEY_ID" \
+        --pending-window-in-days 7 \
+        --profile fffff \
+        --region us-east-2 \
+        >> "$OUTPUT_FILE" 2>&1
+
+    # Add a newline to the log file for separation
+    echo "" >> "$OUTPUT_FILE"
+
+done < "$INPUT_FILE"
+
+echo "Done. Check $OUTPUT_FILE for details."
