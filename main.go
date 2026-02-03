@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"sort"
@@ -31,17 +32,39 @@ type KeyInfo struct {
 }
 
 func main() {
+	// Parse command line flags
+	profile := flag.String("profile", "", "AWS SSO profile name")
+	region := flag.String("region", "", "AWS region")
+	flag.Parse()
+
 	ctx := context.Background()
 
-	// Load AWS configuration
-	cfg, err := config.LoadDefaultConfig(ctx)
+	// Build config options
+	var configOpts []func(*config.LoadOptions) error
+
+	if *profile != "" {
+		configOpts = append(configOpts, config.WithSharedConfigProfile(*profile))
+	}
+
+	if *region != "" {
+		configOpts = append(configOpts, config.WithRegion(*region))
+	}
+
+	// Load AWS configuration with SSO support
+	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading AWS config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Hint: Run 'aws sso login --profile %s' first\n", *profile)
 		os.Exit(1)
 	}
 
 	// Create KMS client
 	client := kms.NewFromConfig(cfg)
+
+	// Display configuration being used
+	fmt.Printf("Using Profile: %s\n", getValueOrDefault(*profile, "default"))
+	fmt.Printf("Using Region:  %s\n", getValueOrDefault(cfg.Region, "default"))
+	fmt.Println()
 
 	// List all keys
 	keys, err := listAllKeys(ctx, client)
@@ -287,4 +310,11 @@ func printSeparator(widths []int) {
 		fmt.Printf("+-%s-", strings.Repeat("-", w))
 	}
 	fmt.Println("+")
+}
+
+func getValueOrDefault(value, defaultValue string) string {
+	if value == "" {
+		return defaultValue
+	}
+	return value
 }
