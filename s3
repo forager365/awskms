@@ -1,0 +1,204 @@
+https://smithy.io/2.0/quickstart.html
+
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
+	"github.com/aws/smithy-go"
+)
+
+type SecretInfo struct {
+	Name        string
+	Description string
+	Tags        map[string]string
+}
+
+func main() {
+	profile := flag.String("profile", "", "AWS SSO profile name")
+	region := flag.String("region", "", "AWS region")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	cfg, err := loadAWSConfig(ctx, *profile, *region)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading AWS config: %v\n", err)
+		os.Exit(1)
+	}
+
+	client := secretsmanager.NewFromConfig(cfg)
+
+	secrets, allTagKeys, err := listSecretsWithTags(ctx, client)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing secrets: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(secrets) == 0 {
+		fmt.Println("No secrets found (or no access to any secrets)")
+		return
+	}
+
+	printSecretsTable(secrets, allTagKeys)
+}
+
+func loadAWSConfig(ctx context.Context, profile, region string) (aws.Config, error) {
+	var opts []func(*config.LoadOptions) error
+
+	if profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(profile))
+	}
+
+	if region != "" {
+		opts = append(opts, config.WithRegion(region))
+	}
+
+	return config.LoadDefaultConfig(ctx, opts...)
+}
+
+func listSecretsWithTags(ctx context.Context, client *secretsmanager.Client) ([]SecretInfo, []string, error) {
+	var secrets []SecretInfo
+	tagKeySet := make(map[string]struct{})
+
+	paginator := secretsmanager.NewListSecretsPaginator(client, &secretsmanager.ListSecretsInput{})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			if isNotAuthorizedError(err) {
+				fmt.Fprintf(os.Stderr, "Warning: Not authorized to list secrets, skipping...\n")
+				return secrets, nil, nil
+			}
+			return nil, nil, fmt.Errorf("failed to list secrets: %w", err)
+		}
+
+		for _, secret := range page.SecretList {
+			secretInfo := SecretInfo{
+				Name:        aws.ToString(secret.Name),
+				Description: aws.ToString(secret.Description),
+				Tags:        make(map[string]string),
+			}
+
+			// Get tags for this secret
+			tags, err := getSecretTags(ctx, client, secret.ARN)
+			if err != nil {
+				if isNotAuthorizedError(err) {
+					// Skip tag retrieval if not authorized
+					continue
+				}
+				// Log warning but continue
+				fmt.Fprintf(os.Stderr, "Warning: Could not get tags for %s: %v\n", secretInfo.Name, err)
+			} else {
+				for _, tag := range tags {
+					key := aws.ToString(tag.Key)
+					value := aws.ToString(tag.Value)
+					secretInfo.Tags[key] = value
+					tagKeySet[key] = struct{}{}
+				}
+			}
+
+			secrets = append(secrets, secretInfo)
+		}
+	}
+
+	// Convert tag key set to sorted slice
+	var allTagKeys []string
+	for key := range tagKeySet {
+		allTagKeys = append(allTagKeys, key)
+	}
+	sort.Strings(allTagKeys)
+
+	return secrets, allTagKeys, nil
+}
+
+func getSecretTags(ctx context.Context, client *secretsmanager.Client, secretARN *string) ([]types.Tag, error) {
+	if secretARN == nil {
+		return nil, nil
+	}
+
+	output, err := client.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
+		SecretId: secretARN,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return output.Tags, nil
+}
+
+func isNotAuthorizedError(err error) bool {
+	var apiErr smithy.APIError
+	if ok := errors.As(err, &apiErr); ok {
+		code := apiErr.ErrorCode()
+		return code == "AccessDeniedException" ||
+			code == "UnauthorizedOperation" ||
+			code == "UnauthorizedException" ||
+			strings.Contains(code, "NotAuthorized")
+	}
+	return false
+}
+
+func printSecretsTable(secrets []SecretInfo, tagKeys []string) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+
+	// Build header
+	headers := []string{"NAME", "DESCRIPTION"}
+	for _, key := range tagKeys {
+		headers = append(headers, strings.ToUpper(key))
+	}
+	fmt.Fprintln(w, strings.Join(headers, "\t"))
+
+	// Build separator
+	separators := make([]string, len(headers))
+	for i, h := range headers {
+		separators[i] = strings.Repeat("-", len(h))
+	}
+	fmt.Fprintln(w, strings.Join(separators, "\t"))
+
+	// Print each secret
+	for _, secret := range secrets {
+		description := secret.Description
+		if description == "" {
+			description = "-"
+		}
+
+		row := []string{secret.Name, description}
+
+		for _, tagKey := range tagKeys {
+			if value, exists := secret.Tags[tagKey]; exists && value != "" {
+				row = append(row, value)
+			} else {
+				row = append(row, "-")
+			}
+		}
+
+		fmt.Fprintln(w, strings.Join(row, "\t"))
+	}
+
+	w.Flush()
+}
+=========
+module secrets-lister
+
+go 1.21
+
+require (
+	github.com/aws/aws-sdk-go-v2 v1.32.6
+	github.com/aws/aws-sdk-go-v2/config v1.28.6
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.34.7
+	github.com/aws/smithy-go v1.22.1
+)
+===========
+./secrets-lister --profile my-sso-profile --region us-east-1
