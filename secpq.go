@@ -2,27 +2,27 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/smithy-go"
-	"github.com/parquet-go/parquet-go"
+	"github.com/xitongsys/parquet-go-source/local"
+	"github.com/xitongsys/parquet-go/parquet"
+	"github.com/xitongsys/parquet-go/writer"
 )
 
 type SecretRecord struct {
-	Name             string            `parquet:"name"`
-	Description      *string           `parquet:"description,optional"`
-	CreatedDate      *time.Time        `parquet:"created_date,optional,timestamp(millisecond)"`
-	LastAccessedDate *parquet.Date     `parquet:"last_accessed_date,optional"`
-	Tags             map[string]string `parquet:"tags,optional"`
+	Name             string             `parquet:"name=name, type=BYTE_ARRAY, convertedtype=UTF8, encoding=PLAIN_DICTIONARY"`
+	Description      *string            `parquet:"name=description, type=BYTE_ARRAY, convertedtype=UTF8, encoding=PLAIN_DICTIONARY"`
+	CreatedDate      *int32             `parquet:"name=created_date, type=INT32, convertedtype=DATE"`
+	LastAccessedDate *int32             `parquet:"name=last_accessed_date, type=INT32, convertedtype=DATE"`
+	Tags             map[string]string  `parquet:"name=tags, type=MAP, convertedtype=MAP, keytype=BYTE_ARRAY, keyconvertedtype=UTF8, valuetype=BYTE_ARRAY, valueconvertedtype=UTF8"`
 }
 
 func main() {
@@ -99,14 +99,15 @@ func listSecrets(ctx context.Context, client *secretsmanager.Client) ([]SecretRe
 			}
 
 			if secret.CreatedDate != nil {
-				record.CreatedDate = secret.CreatedDate
+				// Convert to days since Unix epoch for DATE type
+				days := int32(secret.CreatedDate.Unix() / 86400)
+				record.CreatedDate = &days
 			}
 
 			if secret.LastAccessedDate != nil {
-				// Convert to parquet.Date (days since Unix epoch)
+				// Convert to days since Unix epoch for DATE type
 				days := int32(secret.LastAccessedDate.Unix() / 86400)
-				date := parquet.Date(days)
-				record.LastAccessedDate = &date
+				record.LastAccessedDate = &days
 			}
 
 			if len(secret.Tags) > 0 {
@@ -126,20 +127,28 @@ func listSecrets(ctx context.Context, client *secretsmanager.Client) ([]SecretRe
 }
 
 func writeParquet(filename string, secrets []SecretRecord) error {
-	file, err := os.Create(filename)
+	fw, err := local.NewLocalFileWriter(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
+	defer fw.Close()
 
-	writer := parquet.NewGenericWriter[SecretRecord](file)
-
-	if _, err := writer.Write(secrets); err != nil {
-		return fmt.Errorf("failed to write records: %w", err)
+	pw, err := writer.NewParquetWriter(fw, new(SecretRecord), 4)
+	if err != nil {
+		return fmt.Errorf("failed to create parquet writer: %w", err)
 	}
 
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close writer: %w", err)
+	pw.RowGroupSize = 128 * 1024 * 1024 // 128MB
+	pw.CompressionType = parquet.CompressionCodec_SNAPPY
+
+	for _, record := range secrets {
+		if err := pw.Write(record); err != nil {
+			return fmt.Errorf("failed to write record: %w", err)
+		}
+	}
+
+	if err := pw.WriteStop(); err != nil {
+		return fmt.Errorf("failed to finalize parquet: %w", err)
 	}
 
 	return nil
@@ -155,12 +164,4 @@ func isNotAuthorizedError(err error) bool {
 			strings.Contains(code, "NotAuthorized")
 	}
 	return false
-}
-
-// Keep JSON output as alternative (for debugging)
-func writeJSON(secrets []SecretRecord) {
-	encoder := json.NewEncoder(os.Stdout)
-	for _, secret := range secrets {
-		encoder.Encode(secret)
-	}
 }
